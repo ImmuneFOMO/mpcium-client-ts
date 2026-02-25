@@ -1,3 +1,4 @@
+import { ed25519 } from "@noble/curves/ed25519";
 import { secp256k1 } from "@noble/curves/secp256k1";
 import { hmac } from "@noble/hashes/hmac";
 import { keccak_256 } from "@noble/hashes/sha3";
@@ -7,6 +8,7 @@ import { bytesToHex, hexToBytes, utf8ToBytes } from "@noble/hashes/utils";
 const HARDENED_KEY_START = 0x80000000;
 const CHAIN_CODE_BYTES = 32;
 const COMPRESSED_PUBKEY_BYTES = 33;
+const ED25519_COMPRESSED_PUBKEY_BYTES = 32;
 
 /**
  * Derive a compressed child public key from a compressed master public key.
@@ -70,6 +72,68 @@ export function deriveSecp256k1ChildCompressed(
   }
 
   return currentPubKey;
+}
+
+/**
+ * Derive a compressed child public key from a compressed master public key on ed25519.
+ * Uses BIP-32 non-hardened derivation (public key only, no private key needed).
+ *
+ * @param masterPubKeyCompressed - 32-byte compressed ed25519 public key
+ * @param chainCodeHex - 32-byte chain code as hex string (64 chars)
+ * @param path - derivation path as array of non-hardened indices
+ * @returns 32-byte compressed child public key (standard ed25519 format)
+ * @throws if any index >= 0x80000000 (hardened), or if derivation produces invalid key
+ */
+export function deriveEd25519ChildCompressed(
+  masterPubKeyCompressed: Uint8Array,
+  chainCodeHex: string,
+  path: number[]
+): Uint8Array {
+  if (masterPubKeyCompressed.length !== ED25519_COMPRESSED_PUBKEY_BYTES) {
+    throw new Error(
+      `invalid master pubkey length: ${masterPubKeyCompressed.length}`
+    );
+  }
+
+  let currentPoint: InstanceType<typeof ed25519.ExtendedPoint>;
+  try {
+    currentPoint = ed25519.ExtendedPoint.fromHex(masterPubKeyCompressed);
+  } catch (error) {
+    throw new Error(`decode master pubkey: ${toErrorMessage(error)}`);
+  }
+
+  let currentChainCode = parseChainCode(chainCodeHex);
+
+  for (let depth = 0; depth < path.length; depth += 1) {
+    const index = path[depth];
+    validateChildIndex(index, depth);
+
+    const serialized = serializeEdwardsCompressed(currentPoint.x, currentPoint.y);
+    const data = new Uint8Array(COMPRESSED_PUBKEY_BYTES + 4);
+    data.set(serialized, 0);
+    writeUint32BE(data, index, COMPRESSED_PUBKEY_BYTES);
+
+    const ilr = hmac(sha512, currentChainCode, data);
+    const il = ilr.slice(0, CHAIN_CODE_BYTES);
+    const ir = ilr.slice(CHAIN_CODE_BYTES);
+
+    const ilNum = mod(bytesToBigInt(il), ed25519.CURVE.n);
+    if (ilNum === 0n) {
+      throw new Error(`invalid IL for index ${index}`);
+    }
+
+    const deltaPoint = ed25519.ExtendedPoint.BASE.multiply(ilNum);
+    const childPoint = currentPoint.add(deltaPoint);
+
+    if (childPoint.equals(ed25519.ExtendedPoint.ZERO)) {
+      throw new Error(`invalid child point at index ${index}`);
+    }
+
+    currentPoint = childPoint;
+    currentChainCode = ir;
+  }
+
+  return currentPoint.toRawBytes();
 }
 
 /**
@@ -159,6 +223,24 @@ function parseChainCode(chainCodeHex: string): Uint8Array {
 
 function bytesToBigInt(bytes: Uint8Array): bigint {
   return BigInt(`0x${bytesToHex(bytes)}`);
+}
+
+function mod(a: bigint, n: bigint): bigint {
+  const result = a % n;
+  return result >= 0n ? result : result + n;
+}
+
+/**
+ * Serialize an Edwards curve point as 33 bytes: 1-byte prefix (02/03 based on Y parity) + 32-byte X coordinate (big-endian).
+ * Matches the Go `serializeCompressed(x, y)` helper shared between secp256k1 and ed25519.
+ */
+function serializeEdwardsCompressed(x: bigint, y: bigint): Uint8Array {
+  const prefix = y & 1n ? 0x03 : 0x02;
+  const result = new Uint8Array(COMPRESSED_PUBKEY_BYTES);
+  result[0] = prefix;
+  const xHex = x.toString(16).padStart(64, "0");
+  result.set(hexToBytes(xHex), 1);
+  return result;
 }
 
 function writeUint32BE(target: Uint8Array, value: number, offset: number): void {
